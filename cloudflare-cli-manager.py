@@ -2,11 +2,14 @@ import requests
 import json
 import time
 import os
+import boto3
 
 # Global Variables
 BEARER_TOKEN = os.getenv('CLOUDFLARE_BEARER_TOKEN')
 destination_account_id = os.getenv('CLOUDFLARE_DESTINATION_ACCOUNT_ID')
-
+CLOUDFLARE_BOTO_ACCESS_KEY = os.getenv('CLOUDFLARE_BOTO_ACCESS_KEY')
+CLOUDFLARE_BOTO_SECRET_ACCESS_KEY = os.getenv('CLOUDFLARE_BOTO_SECRET_ACCESS_KEY')
+print(BEARER_TOKEN)
 zone_id_source = ""
 zone_id_destination = ""
 domain_temp = False
@@ -517,6 +520,118 @@ def special_feature():
     print("\nSpecial Feature script complete.")
 
 ##########################
+def get_bucket_info(account_id, bucket_name):
+    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/r2/buckets/{bucket_name}"
+    headers = {
+        "Authorization": f"Bearer {BEARER_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    
+    response = requests.get(url, headers=headers)
+    
+    if response.status_code == 200:
+        bucket_info = response.json()
+        if bucket_info.get('success'):
+            return bucket_info.get('result')
+        else:
+            print(f"Error fetching bucket info: {bucket_info['errors']}")
+            return None
+    else:
+        print(f"Error fetching bucket info: {response.status_code}, {response.text}")
+        return None
+
+##########################
+def list_bucket_objects(bucket_name, bucket_region, access_key_id, secret_access_key):
+    s3_client = boto3.client(
+        's3',
+        aws_access_key_id=access_key_id,
+        aws_secret_access_key=secret_access_key,
+        endpoint_url=f"https://{bucket_region}.r2.cloudflarestorage.com",
+        config=boto3.session.Config(signature_version='s3v4', retries={'max_attempts': 10}, ssl_verify=False)
+    )
+    
+    try:
+        response = s3_client.list_objects_v2(Bucket=bucket_name)
+        if 'Contents' in response:
+            print(f"Objects in bucket '{bucket_name}':")
+            for obj in response['Contents']:
+                print(f"- {obj['Key']} (Last Modified: {obj['LastModified']}, Size: {obj['Size']} bytes)")
+        else:
+            print(f"No objects found in bucket '{bucket_name}'.")
+    except Exception as e:
+        print(f"Error listing objects in bucket '{bucket_name}': {e}")
+
+##########################
+def list_r2_buckets():
+    bucket_account_id = input("\nEnter Account ID: ").strip()
+    if not bucket_account_id:
+        print("No zone ID entered. Bye.")
+        exit(0)
+
+    url = f"https://api.cloudflare.com/client/v4/accounts/{bucket_account_id}/r2/buckets"
+    headers = {
+        "Authorization": f"Bearer {BEARER_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    response = requests.get(url, headers=headers)
+
+    if response.status_code == 200:
+        data = response.json()
+        
+        # Access the correct part of the response structure
+        if 'result' in data and 'buckets' in data['result']:
+            buckets = data['result']['buckets']
+            
+            if not buckets:
+                print("No R2 buckets found.")
+            else:
+                print("R2 Buckets:")
+                for bucket in buckets:
+                    name = bucket.get('name', 'Unknown')
+                    print(f"- {name}")
+        else:
+            print("Unexpected response structure:", data)
+    else:
+        print(f"Error fetching R2 buckets: {response.status_code}, {response.text}")
+
+    delete_bucket_question = input("\nList items for a bucket [Y/n]: ").strip()
+    if delete_bucket_question.lower() != "y":
+        print("Operation aborted by the user. Bye.")
+        return
+     
+    delete_bucket_name = input("\nEnter name of bucket to list items: ").strip()
+    if not delete_bucket_name:
+        print("No bucket name entered. Bye.")
+        exit(0)
+    
+    bucket_info = get_bucket_info(account_id=bucket_account_id, bucket_name=delete_bucket_name)
+    if bucket_info:
+        list_bucket_objects(
+            bucket_name=bucket_info['name'],
+            bucket_region=bucket_info['location'].lower(),
+            access_key_id=CLOUDFLARE_BOTO_ACCESS_KEY,
+            secret_access_key=CLOUDFLARE_BOTO_SECRET_ACCESS_KEY
+        )
+        
+    '''
+    # URL for deleting the specified bucket
+    delete_url = f"https://api.cloudflare.com/client/v4/accounts/{bucket_account_id}/r2/buckets/{delete_bucket_name}"
+    
+    delete_response = requests.delete(delete_url, headers=headers)
+
+    # Check the status code for success or failure
+    if delete_response.status_code == 200:
+        delete_data = delete_response.json()
+        if delete_data.get("success"):
+            print(f"Bucket '{delete_bucket_name}' deleted successfully.")
+        else:
+            print(f"Failed to delete bucket '{delete_bucket_name}'. Error: {delete_data.get('errors')}")
+    else:
+        print(f"Error deleting bucket '{delete_bucket_name}': {delete_response.status_code}, {delete_response.text}")
+    '''
+        
+##########################
 def copy_zone_content():
 
     # List Page Rules
@@ -677,9 +792,11 @@ def main_loop():
     print("   - Clone existing zone to a temporary zone of (almost) the same name in the CFA account")
     print("3] Zone Copy:")
     print("   - Copy settings (excl. DNS records) from one zone to another")
-    print("4] Special Feature")
+    print("4] List R2 Buckets")
+    print("   - Output all existing R2 buckets")
+    print("5] Special Feature")
     print("   - Testing ground for individual functions")
-    print("5] Exit")
+    print("6] Exit")
 
     user_input = input("\nEnter number & return: ")
 
@@ -691,8 +808,10 @@ def main_loop():
     elif user_input == "3":
         zone_copy()
     elif user_input == "4":
-        special_feature()
+        list_r2_buckets()
     elif user_input == "5":
+        special_feature()
+    elif user_input == "6":
         print("\nScript shutting down. Bye.\n")
         exit(0)
     else:
