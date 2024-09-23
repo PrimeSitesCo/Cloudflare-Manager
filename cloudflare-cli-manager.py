@@ -515,7 +515,9 @@ def special_feature():
     
     # set the function you'd like to call 
     # Activate Smart Tiered Caching
-    check_smart_tiered_cache(zone_id_destination)
+    #check_smart_tiered_cache(zone_id_destination)
+    # Check for Edge TTL settings
+    check_edge_ttl_for_zone(zone_id_destination)
 
     print("\nSpecial Feature script complete.")
 
@@ -757,6 +759,79 @@ def zone_copy():
     copy_zone_content()
 
 ##########################
+def check_edge_ttl_for_zone(zone_id):
+    # Retrieve cache rulesets for the zone
+    rulesets_response = make_api_call(f"https://api.cloudflare.com/client/v4/zones/{zone_id}/rulesets?phase=http_request_cache_settings", "GET")
+
+    if not rulesets_response or not rulesets_response.get("success"):
+        return None
+
+    rulesets = rulesets_response.get("result", [])
+
+    for ruleset in rulesets:
+        # Skip rulesets that are likely to produce errors
+        if ruleset.get("phase") not in ["http_request_cache_settings"]:
+            continue
+
+        # Fetch the details of each ruleset
+        ruleset_id = ruleset.get("id")
+        ruleset_details_response = make_api_call(f"https://api.cloudflare.com/client/v4/zones/{zone_id}/rulesets/{ruleset_id}", "GET")
+
+        if not ruleset_details_response or not ruleset_details_response.get("success"):
+            continue
+
+        ruleset_details = ruleset_details_response.get("result", {})
+
+        for rule in ruleset_details.get("rules", []):
+            action = rule.get("action")
+            if action == "set_cache_settings" and "edge_ttl" in rule.get("action_parameters", {}):
+                return rule.get("description", "Unnamed Rule")
+
+    return None
+
+##########################
+def get_all_zones():
+    zones = []
+    page = 1
+    per_page = 50  # Adjust as needed, Cloudflare API typically defaults to 20
+
+    while True:
+        response = make_api_call(f"https://api.cloudflare.com/client/v4/zones?page={page}&per_page={per_page}", "GET")
+        if not response or not response.get("success"):
+            print("Error retrieving zones.")
+            print(response)  # Debug print
+            break
+
+        zones.extend(response.get("result", []))
+        if len(response.get("result", [])) < per_page:
+            break  # No more pages
+
+        page += 1
+
+    return zones
+
+##########################
+def check_edge_ttl_in_cache_rules():
+    print("\nChecking for Edge TTL setting in Cache Rules...")
+
+    zones = get_all_zones()
+    print(f"Found {len(zones)} zones.\n")
+    
+    active_edge_ttl_count = 0
+    for zone in zones:
+        zone_id = zone.get("id")
+        zone_name = zone.get("name")
+
+        edge_ttl_rule_name = check_edge_ttl_for_zone(zone_id)
+        if edge_ttl_rule_name:
+            print(f"{zone_name} - Active Edge TTL setting: {edge_ttl_rule_name}")
+            active_edge_ttl_count += 1
+        else:
+            print(zone_name)
+    
+    print(f"\nTotal zones with active Edge TTL setting: {active_edge_ttl_count}")
+
+##########################
 def print_large_text(text):
     letters = {
         'P': ['████', '█  █', '████', '█   ', '█   '],
@@ -796,7 +871,9 @@ def main_loop():
     print("   - Output all existing R2 buckets")
     print("5] Special Feature")
     print("   - Testing ground for individual functions")
-    print("6] Exit")
+    print("6] Check for Edge TTL setting in Cache Rules")
+    print("   - Check all zones for Edge TTL setting in Cache Rules")
+    print("7] Exit")
 
     user_input = input("\nEnter number & return: ")
 
@@ -812,6 +889,8 @@ def main_loop():
     elif user_input == "5":
         special_feature()
     elif user_input == "6":
+        check_edge_ttl_in_cache_rules()
+    elif user_input == "7":
         print("\nScript shutting down. Bye.\n")
         exit(0)
     else:
