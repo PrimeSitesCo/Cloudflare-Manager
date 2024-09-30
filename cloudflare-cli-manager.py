@@ -1,3 +1,4 @@
+import sys
 import requests
 import json
 import time
@@ -9,23 +10,29 @@ BEARER_TOKEN = os.getenv('CLOUDFLARE_BEARER_TOKEN')
 destination_account_id = os.getenv('CLOUDFLARE_DESTINATION_ACCOUNT_ID')
 CLOUDFLARE_BOTO_ACCESS_KEY = os.getenv('CLOUDFLARE_BOTO_ACCESS_KEY')
 CLOUDFLARE_BOTO_SECRET_ACCESS_KEY = os.getenv('CLOUDFLARE_BOTO_SECRET_ACCESS_KEY')
-print(BEARER_TOKEN)
+
 zone_id_source = ""
 zone_id_destination = ""
 domain_temp = False
 
 ##########################
-def make_api_call(url, method, data=None):
+def make_api_call(url, method, data=None, retries=3, delay=5):
     headers = {
         "Authorization": f"Bearer {BEARER_TOKEN}",
         "Content-Type": "application/json"
     }
-    response = requests.request(method, url, headers=headers, json=data)
-    if response.status_code == 200:
-        return response.json()
-    else:
-        print(f"API call failed with status code {response.status_code}: {response.text}")
-        return None
+    for attempt in range(retries):
+        response = requests.request(method, url, headers=headers, json=data)
+        if response.status_code in [200, 201]:
+            return response.json()
+        elif response.status_code in [502, 503, 504]:
+            print(f"API call failed with status code {response.status_code}. Retrying in {delay} seconds...")
+            time.sleep(delay)
+        else:
+            print(f"API call failed with status code {response.status_code}: {response.text}")
+            return None
+    print(f"API call failed after {retries} attempts.")
+    return None
     
 ##########################
 def format_headers(headers):
@@ -498,26 +505,196 @@ def check_smart_tiered_cache(zone_id):
         print(f"\nError activating Smart Tiered Caching for zone {zone_id}. Response:", response)
 
 ##########################
+def add_port_firewall_rule_to_zone():
+
+    if len(sys.argv) > 2:
+        domain_name = sys.argv[2]
+    else:
+        domain_name = input("Enter Zone Domain Name: ").strip()
+
+    if not domain_name:
+        print("No domain name entered. Bye.")
+        return
+
+    # Search for the Domain Across All Zones
+    search_results = make_api_call(f"https://api.cloudflare.com/client/v4/zones?name={domain_name}", "GET")
+
+    # Process Search Results
+    result_count = len(search_results.get('result', []))
+    if result_count != 1:
+        print(f"Error: Zone not found or multiple zones found for {domain_name}. Bye.")
+        return
+
+    zone_id = search_results['result'][0]['id']
+
+    # Retrieve existing WAF rules to determine the highest priority
+    existing_rules_response = make_api_call(f"https://api.cloudflare.com/client/v4/zones/{zone_id}/firewall/rules", "GET")
+    if not existing_rules_response or not existing_rules_response.get("success"):
+        print(f"Error retrieving existing WAF rules for {domain_name}. Response: {existing_rules_response}")
+        return
+
+    existing_rules = existing_rules_response.get("result", [])
+    highest_priority = max([rule.get("priority", 0) for rule in existing_rules if "priority" in rule], default=0)
+
+    # Define the new WAF rule with a priority higher than the highest existing priority
+    waf_rule_data = {
+        "description": "80 443",
+        "filter": {
+            "expression": "not (cf.edge.server_port in {80 443})",
+            "paused": False
+        },
+        "action": "block",
+        "priority": highest_priority + 1,  # Set a priority value higher than the highest existing priority
+        "paused": False
+    }
+
+    # Add the new WAF rule
+    response = make_api_call(f"https://api.cloudflare.com/client/v4/zones/{zone_id}/firewall/rules", "POST", [waf_rule_data])
+
+    if response and response.get("success"):
+        print(f"Successfully added WAF rule to block requests if port is not in [80, 443] for domain {domain_name}.")
+        
+        # Retrieve all rules again to reorder them
+        all_rules_response = make_api_call(f"https://api.cloudflare.com/client/v4/zones/{zone_id}/firewall/rules", "GET")
+        if not all_rules_response or not all_rules_response.get("success"):
+            print(f"Error retrieving all WAF rules for reordering. Response: {all_rules_response}")
+            return
+
+        all_rules = all_rules_response.get("result", [])
+        # Sort rules by priority, providing a default value if 'priority' is missing
+        all_rules_sorted = sorted(all_rules, key=lambda x: x.get('priority', 0))
+        
+        # Reassign priorities to ensure the new rule is last
+        for i, rule in enumerate(all_rules_sorted):
+            rule['priority'] = i + 1
+
+        # Update the rules with new priorities
+        update_response = make_api_call(f"https://api.cloudflare.com/client/v4/zones/{zone_id}/firewall/rules", "PUT", all_rules_sorted)
+        if update_response and update_response.get("success"):
+            print(f"Successfully reordered WAF rules for domain {domain_name}.")
+        else:
+            print(f"Error reordering WAF rules. Response: {update_response}")
+    else:
+        print(f"Error adding WAF rule. Response: {response}")
+
+##########################
+def check_wordfence_rule_for_domain(domain_name):
+    print(f"\nChecking for 'Wordfence' WAF custom rules in domain: {domain_name}...")
+
+    # Search for the Domain Across All Zones
+    search_results = make_api_call(f"https://api.cloudflare.com/client/v4/zones?name={domain_name}", "GET")
+
+    # Process Search Results
+    result_count = len(search_results.get('result', []))
+    if result_count != 1:
+        print(f"Error: Zone not found or multiple zones found for {domain_name}. Bye.")
+        return
+
+    zone_id = search_results['result'][0]['id']
+    zone_name = search_results['result'][0]['name']
+
+    # Retrieve WAF custom rules for the zone
+    waf_rules_response = make_api_call(f"https://api.cloudflare.com/client/v4/zones/{zone_id}/firewall/rules", "GET")
+
+    if not waf_rules_response or not waf_rules_response.get("success"):
+        print(f"Error retrieving WAF custom rules for {zone_name}. Response: {waf_rules_response}")
+        return
+
+    waf_rules = waf_rules_response.get("result", [])
+
+    # Check if any rule contains "Wordfence" in the title
+    wordfence_rules = [rule for rule in waf_rules if "Wordfence" in rule.get("description", "")]
+
+    if wordfence_rules:
+        print(f"Domain {zone_name} has the following custom WAF rules containing 'Wordfence' in the title:")
+        for rule in wordfence_rules:
+            print(f"- {rule.get('description', 'No description')}")
+    else:
+        print(f"No custom WAF rules containing 'Wordfence' in the title found for domain {zone_name}.")
+
+##########################
+def check_zones_for_rule_per_page(rule_name):
+    
+    print(f"\nChecking zones for custom WAF rules containing '{rule_name}' in the title and NOT containing '443'...")
+
+    zones = get_all_zones(page=1, per_page=1000)
+    matching_zones_count = 0
+
+    for zone in zones:
+        zone_id = zone.get("id")
+        zone_name = zone.get("name")
+
+        # Retrieve WAF custom rules for the zone
+        waf_rules_response = make_api_call(f"https://api.cloudflare.com/client/v4/zones/{zone_id}/firewall/rules", "GET")
+
+        if not waf_rules_response or not waf_rules_response.get("success"):
+            print(f"Error retrieving WAF custom rules for {zone_name}. Response: {waf_rules_response}")
+            continue
+
+        waf_rules = waf_rules_response.get("result", [])
+
+        # Check if any rule contains the specified rule name string in the title
+        matching_rules = [rule for rule in waf_rules if rule_name in rule.get("description", "")]
+        contains_443_rule = any("443" in rule.get("description", "") for rule in waf_rules)
+
+        if matching_rules:
+            matching_zones_count += 1
+            if not contains_443_rule:
+                print(f"\nDomain: {zone_name}")
+                for rule in matching_rules:
+                    print(f"- {rule.get('description', 'No description')}")
+
+    print(f"\nFinished checking zones for custom WAF rules containing '{rule_name}' in the title and not containing '443'.")
+    print(f"Number of zones with custom WAF rules containing '{rule_name}': {matching_zones_count}")
+
+##########################
 def special_feature():
     global zone_id_source, zone_id_destination
 
-    '''
+    # Verify API token
+    verify_api_token()
+
     # Prompt for source and destination zone IDs
+    '''
     zone_id_source = input("\nEnter Source Zone ID: ").strip()
     if not zone_id_source:
         print("No zone ID entered. Bye.")
         exit(0)
     '''
+    # Prompt for Zone ID
+    '''
     zone_id_destination = input("\nEnter Destination Zone ID: ").strip()
     if not zone_id_destination:
         print("No zone ID entered. Bye.")
         exit(0)
-    
+    '''
+    # Prompt for a single domain name
+    ''' 
+    domain_name = input("\nEnter the domain name to check for 'Wordfence' WAF custom rules: ").strip()
+    if not domain_name:
+        print("No domain name entered. Bye.")
+        exit(0)
+    '''
+    # Prompt for the rule name string
+    rule_name = input("\nEnter the rule name string to search for: ").strip()
+    if not rule_name:
+        print("No rule name string entered. Bye.")
+        exit(0)
+
+    # Check the first 10 zones for the specified rule name string
+    check_zones_for_rule_per_page(rule_name)
+
     # set the function you'd like to call 
     # Activate Smart Tiered Caching
     #check_smart_tiered_cache(zone_id_destination)
     # Check for Edge TTL settings
-    check_edge_ttl_for_zone(zone_id_destination)
+    #check_edge_ttl_for_zone(zone_id_destination)
+
+    # Troubleshooting: Output env vars to console
+    #print(f"{BEARER_TOKEN} \n{destination_account_id} \n{CLOUDFLARE_BOTO_ACCESS_KEY} \n{CLOUDFLARE_BOTO_SECRET_ACCESS_KEY}")
+
+    # Check for 'Wordfence' WAF custom rules in the specified domain
+    #check_wordfence_rule_for_domain(domain_name)
 
     print("\nSpecial Feature script complete.")
 
@@ -790,46 +967,248 @@ def check_edge_ttl_for_zone(zone_id):
     return None
 
 ##########################
-def get_all_zones():
+def get_all_zones(page=None, per_page=50):
     zones = []
-    page = 1
-    per_page = 50  # Adjust as needed, Cloudflare API typically defaults to 20
-
-    while True:
+    if page is not None:
+        # Fetch a specific page of zones
         response = make_api_call(f"https://api.cloudflare.com/client/v4/zones?page={page}&per_page={per_page}", "GET")
         if not response or not response.get("success"):
             print("Error retrieving zones.")
             print(response)  # Debug print
-            break
-
+            return zones
         zones.extend(response.get("result", []))
-        if len(response.get("result", [])) < per_page:
-            break  # No more pages
-
-        page += 1
-
+    else:
+        # Fetch all zones in a paginated manner
+        current_page = 1
+        while True:
+            response = make_api_call(f"https://api.cloudflare.com/client/v4/zones?page={current_page}&per_page={per_page}", "GET")
+            if not response or not response.get("success"):
+                print("Error retrieving zones.")
+                print(response)  # Debug print
+                break
+            zones.extend(response.get("result", []))
+            if len(response.get("result", [])) < per_page:
+                break  # No more pages
+            current_page += 1
     return zones
 
 ##########################
 def check_edge_ttl_in_cache_rules():
-    print("\nChecking for Edge TTL setting in Cache Rules...")
+    choice = input("Do you want to check Cache Rules Edge TTL setting for all zones or a single domain? (all/single): ").strip().lower()
 
+    if choice == "single":
+        zone_id = input("Enter Zone ID: ").strip()
+        if not zone_id:
+            print("No zone ID entered. Bye.")
+            return
+
+        edge_ttl_rule_name = check_edge_ttl_for_zone(zone_id)
+        if edge_ttl_rule_name:
+            print(f"Zone ID {zone_id} - Active Edge TTL setting: {edge_ttl_rule_name}")
+        else:
+            print(f"Zone ID {zone_id} - No Edge TTL rule")
+    elif choice == "all":
+        print("Checking for Edge TTL setting in Cache Rules...")
+
+        zones = get_all_zones()
+        print(f"Found {len(zones)} zones.")
+        
+        active_edge_ttl_count = 0
+        for zone in zones:
+            zone_id = zone.get("id")
+            zone_name = zone.get("name")
+
+            edge_ttl_rule_name = check_edge_ttl_for_zone(zone_id)
+            if edge_ttl_rule_name:
+                print(f"{zone_name} - Active Edge TTL setting: {edge_ttl_rule_name}")
+                active_edge_ttl_count += 1
+            else:
+                print(zone_name)
+        
+        print(f"\nTotal zones with active Edge TTL setting: {active_edge_ttl_count}")
+    else:
+        print("Invalid choice. Please enter 'all' or 'single'.")
+
+##########################
+
+def list_cache_rules_for_zone(zone_id):
+    # Retrieve cache rulesets for the zone
+    rulesets_response = make_api_call(f"https://api.cloudflare.com/client/v4/zones/{zone_id}/rulesets?phase=http_request_cache_settings", "GET")
+
+    if not rulesets_response or not rulesets_response.get("success"):
+        print("Error retrieving rulesets.")
+        return
+
+    rulesets = rulesets_response.get("result", [])
+
+    for ruleset in rulesets:
+        # Skip rulesets that are likely to produce errors
+        if ruleset.get("phase") not in ["http_request_cache_settings"]:
+            continue
+
+        # Fetch the details of each ruleset
+        ruleset_id = ruleset.get("id")
+        ruleset_details_response = make_api_call(f"https://api.cloudflare.com/client/v4/zones/{zone_id}/rulesets/{ruleset_id}", "GET")
+
+        if not ruleset_details_response or not ruleset_details_response.get("success"):
+            print(f"Error retrieving details for ruleset {ruleset_id}.")
+            continue
+
+        ruleset_details = ruleset_details_response.get("result", {})
+        print(f"Ruleset: {ruleset_details.get('name', 'Unnamed Ruleset')}")
+
+        for rule in ruleset_details.get("rules", []):
+            print(f" - Rule: {rule.get('description', 'Unnamed Rule')}")
+
+##########################
+def fetch_ruleset_details(zone_id, ruleset_id):
+    return make_api_call(f"https://api.cloudflare.com/client/v4/zones/{zone_id}/rulesets/{ruleset_id}", "GET")
+
+def list_cache_rules_for_all_zones(rule_name):
     zones = get_all_zones()
-    print(f"Found {len(zones)} zones.\n")
-    
-    active_edge_ttl_count = 0
+    print(f"Found {len(zones)} zones.")
+
+    matching_zones = []
+
     for zone in zones:
         zone_id = zone.get("id")
         zone_name = zone.get("name")
 
-        edge_ttl_rule_name = check_edge_ttl_for_zone(zone_id)
-        if edge_ttl_rule_name:
-            print(f"{zone_name} - Active Edge TTL setting: {edge_ttl_rule_name}")
-            active_edge_ttl_count += 1
-        else:
-            print(zone_name)
-    
-    print(f"\nTotal zones with active Edge TTL setting: {active_edge_ttl_count}")
+        rulesets_response = make_api_call(f"https://api.cloudflare.com/client/v4/zones/{zone_id}/rulesets?phase=http_request_cache_settings", "GET")
+
+        if not rulesets_response or not rulesets_response.get("success"):
+            continue
+
+        rulesets = rulesets_response.get("result", [])
+
+        for ruleset in rulesets:
+            # Fetch the details of each ruleset
+            ruleset_id = ruleset.get("id")
+            ruleset_details_response = fetch_ruleset_details(zone_id, ruleset_id)
+
+            if not ruleset_details_response or not ruleset_details_response.get("success"):
+                continue
+
+            ruleset_details = ruleset_details_response.get("result", {})
+            rules = ruleset_details.get("rules", [])
+
+            # Check if any rule contains the entered Cache Rule name
+            for rule in rules:
+                if rule_name.lower() in rule.get("description", "").lower():
+                    matching_zones.append(zone_name)
+                    break
+
+    if matching_zones:
+        print("Zones with matching cache rules:")
+        for zone in matching_zones:
+            print(f"- {zone}")
+    else:
+        print("No zones found with matching cache rules.")
+
+##########################
+def add_no_cache_rule(zone_id):
+    url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/rulesets"
+    headers = {
+        "Authorization": f"Bearer {BEARER_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "name": "No Cache",
+        "description": "No Cache",
+        "kind": "zone",
+        "phase": "http_request_cache_settings",
+        "rules": [
+            {
+                "action": "set_cache_settings",
+                "description": "No Cache",
+                "expression": "true",
+                "enabled": True,
+                "action_parameters": {
+                    "cache": False
+                }
+            }
+        ]
+    }
+
+    response = requests.post(url, headers=headers, json=data)
+
+    if response.status_code == 200:
+        print(f"Successfully added 'No Cache' rule to zone ID {zone_id}.")
+    else:
+        print(f"Error adding 'No Cache' rule: {response.status_code}, {response.text}")
+
+##########################
+def add_no_cache_rule_to_existing_ruleset(zone_id):
+    # Retrieve existing rulesets for the zone
+    rulesets_response = make_api_call(f"https://api.cloudflare.com/client/v4/zones/{zone_id}/rulesets?phase=http_request_cache_settings", "GET")
+
+    if not rulesets_response or not rulesets_response.get("success"):
+        print(f"Error retrieving rulesets: {rulesets_response.get('errors')}")
+        return
+
+    rulesets = rulesets_response.get("result", [])
+    if not rulesets:
+        print("No existing rulesets found for the specified phase.")
+        return
+
+    # Use the first ruleset found
+    ruleset_id = rulesets[0].get("id")
+    ruleset_details_response = make_api_call(f"https://api.cloudflare.com/client/v4/zones/{zone_id}/rulesets/{ruleset_id}", "GET")
+
+    if not ruleset_details_response or not ruleset_details_response.get("success"):
+        print(f"Error retrieving ruleset details: {ruleset_details_response.get('errors')}")
+        return
+
+    ruleset_details = ruleset_details_response.get("result", {})
+    rules = ruleset_details.get("rules", [])
+
+    # Add the "No Cache" rule at the first position
+    no_cache_rule = {
+        "action": "set_cache_settings",
+        "description": "No Cache",
+        "expression": "true",
+        "enabled": True,
+        "action_parameters": {
+            "bypass_cache": True
+        }
+    }
+    rules.insert(0, no_cache_rule)
+
+    # Update the ruleset with the new rule
+    update_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/rulesets/{ruleset_id}"
+    headers = {
+        "Authorization": f"Bearer {BEARER_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "rules": rules
+    }
+
+    response = requests.put(update_url, headers=headers, json=data)
+
+    if response.status_code == 200:
+        print(f"Successfully added 'No Cache' rule to zone ID {zone_id}.")
+    else:
+        print(f"Error adding 'No Cache' rule: {response.status_code}, {response.text}")
+
+##########################
+def add_no_cache_rule_to_zone():
+    zone_name = input("Enter Zone Domain Name: ").strip()
+    if not zone_name:
+        print("No domain name entered. Bye.")
+        return
+
+    # Search for the Domain Across All Zones
+    search_results = make_api_call(f"https://api.cloudflare.com/client/v4/zones?name={zone_name}", "GET")
+
+    # Process Search Results
+    result_count = len(search_results.get('result', []))
+    if result_count != 1:
+        print(f"Error: Zone not found or multiple zones found for {zone_name}. Bye.")
+        return
+
+    zone_id = search_results['result'][0]['id']
+    add_no_cache_rule_to_existing_ruleset(zone_id)
 
 ##########################
 def print_large_text(text):
@@ -855,27 +1234,36 @@ def print_large_text(text):
 def main_loop():
     global domain_temp
 
-    #print_large_text("PrimeSites")
-    print("\n#######################################")
-    print("\n Cloudflare Zone Manager by PrimeSites ")
-    print("\n#######################################")
-    print("\nSelect an option:\n")
+    if len(sys.argv) > 1:
+        user_input = sys.argv[1]
+    else:
+        #print_large_text("PrimeSites")
+        print("\n#######################################")
+        print("\n Cloudflare Zone Manager by PrimeSites ")
+        print("\n#######################################")
+        print("\nSelect an option:\n")
 
-    print("1] Zone Clone:")
-    print("   - Clone existing zone to a new zone of the same name in the CFA account")
-    print("2] Zone Clone (Temporary):")
-    print("   - Clone existing zone to a temporary zone of (almost) the same name in the CFA account")
-    print("3] Zone Copy:")
-    print("   - Copy settings (excl. DNS records) from one zone to another")
-    print("4] List R2 Buckets")
-    print("   - Output all existing R2 buckets")
-    print("5] Special Feature")
-    print("   - Testing ground for individual functions")
-    print("6] Check for Edge TTL setting in Cache Rules")
-    print("   - Check all zones for Edge TTL setting in Cache Rules")
-    print("7] Exit")
+        print("1] Zone Clone:")
+        print("   - Clone existing zone to a new zone of the same name in the CFA account")
+        print("2] Zone Clone (Temporary):")
+        print("   - Clone existing zone to a temporary zone of (almost) the same name in the CFA account")
+        print("3] Zone Copy:")
+        print("   - Copy settings (excl. DNS records) from one zone to another")
+        print("4] List R2 Buckets")
+        print("   - Output all existing R2 buckets")
+        print("5] Special Feature")
+        print("   - Testing ground for individual functions")
+        print("6] Check for Edge TTL setting in Cache Rules")
+        print("   - Check all zones for Edge TTL setting in Cache Rules")
+        print("7] List Cache Rules for a Zone")
+        print("   - List the names of Cache Rules for a specific zone or all zones with a specific rule")
+        print("8] Add 'No Cache' Rule to a Zone")
+        print("   - Add a 'No Cache' rule to a specific zone")
+        print("9] Add Port Firewall rule to a Zone")
+        print("   - Add WAF Rule to Zone to Block if Port is not in [80 443]")
+        print("10] Exit")
 
-    user_input = input("\nEnter number & return: ")
+        user_input = input("\nEnter number & return: ")
 
     if user_input == "1":
         zone_clone()
@@ -891,6 +1279,26 @@ def main_loop():
     elif user_input == "6":
         check_edge_ttl_in_cache_rules()
     elif user_input == "7":
+        choice = input("Do you want to list Cache Rules for all zones or a single domain? (all/single): ").strip().lower()
+        if choice == "single":
+            zone_id = input("Enter Zone ID: ").strip()
+            if not zone_id:
+                print("No zone ID entered. Bye.")
+            else:
+                list_cache_rules_for_zone(zone_id)
+        elif choice == "all":
+            rule_name = input("Enter Cache Rule name to look for: ").strip()
+            if not rule_name:
+                print("No rule name entered. Bye.")
+            else:
+                list_cache_rules_for_all_zones(rule_name)
+        else:
+            print("Invalid choice. Please enter 'all' or 'single'.")
+    elif user_input == "8":
+        add_no_cache_rule_to_zone()
+    elif user_input == "9":
+        add_port_firewall_rule_to_zone()
+    elif user_input == "10":
         print("\nScript shutting down. Bye.\n")
         exit(0)
     else:
